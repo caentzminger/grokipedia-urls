@@ -1,0 +1,24 @@
+[project]
+name = "grokipedia-urls"
+version = "0.1.0"
+description = "A dataset of Grokipedia URLs per the sitemap"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "anyio>=4.12.1",
+    "datasets>=4.7.0",
+    "huggingface_hub>=0.28.0",
+    "httpx>=0.28.1",
+    "polars>=1.39.0",
+    "psutil>=6.1.0",
+    "python-dotenv>=1.0.0",
+    "rich>=14.3.3",
+    "typer>=0.24.1",
+    "tooltime>=0.3.5",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.6",
+    "ty>=0.0.23",
+]

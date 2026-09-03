@@ -1,0 +1,33 @@
+name: Run Grokipedia URL Collector
+
+on:
+  schedule:
+    # Every Sunday at 00:00 UTC (start of week)
+    - cron: "0 0 * * 0"
+  workflow_dispatch: # Manual trigger
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.6.0"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: ".python-version"
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Run main.py
+        run: uv run main.py
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
