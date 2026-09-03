@@ -1,6 +1,7 @@
 skills-lock.json
 .agents/
 .env
+.DS_Store
 /data/
 # Python-generated files
 __pycache__/
