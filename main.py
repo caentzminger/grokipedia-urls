@@ -8,7 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import anyio
@@ -24,13 +24,14 @@ load_dotenv(override=True)
 SITEMAP_INDEX_URL = "https://assets.grokipedia.com/sitemap/sitemap-index.xml"
 HF_REPO_ID = "caentzminger/grokipedia-urls"
 CONCURRENCY_LIMIT = 20
+VOLATILE_DATASET_COLUMNS = {"fetched_at"}
 
 pl.Config.set_engine_affinity("streaming")
 
 app = typer.Typer(help="Grokipedia URL dataset collector")
 
 
-def fmt_num(n: int | float) -> str:
+def fmt_num(n: float) -> str:
     return f"{n:,}"
 
 
@@ -57,23 +58,40 @@ def needs_push(new_data_path: Path, repo_id: str) -> bool:
         )
         new = pl.scan_parquet(new_data_path)
 
-        stats = existing.select(
-            pl.len().alias("count"), pl.col("url").hash().sum().alias("hash")
-        ).collect()
-        existing_count: int = stats.item(0, "count")
-        existing_hash: int = stats.item(0, "hash")
+        existing_columns = set(existing.collect_schema().names())
+        new_columns = set(new.collect_schema().names())
+        if existing_columns != new_columns:
+            logger.log(
+                f"Schema differs: HF {sorted(existing_columns)} vs "
+                f"local {sorted(new_columns)}"
+            )
+            return True
 
-        new_stats = new.select(
-            pl.len().alias("count"), pl.col("url").hash().sum().alias("hash")
-        ).collect()
-        new_count: int = new_stats.item(0, "count")
-        new_hash: int = new_stats.item(0, "hash")
+        compare_columns = sorted(existing_columns - VOLATILE_DATASET_COLUMNS)
+
+        def fingerprint(frame: pl.LazyFrame) -> tuple[int, int]:
+            normalized_columns = [
+                pl.col(column).cast(pl.String).fill_null("<null>").alias(column)
+                for column in compare_columns
+            ]
+            stats = frame.select(
+                pl.len().alias("count"),
+                pl.struct(normalized_columns).hash().sum().alias("hash"),
+            ).collect()
+            return stats.item(0, "count"), stats.item(0, "hash")
+
+        existing_count, existing_hash = fingerprint(existing)
+        new_count, new_hash = fingerprint(new)
 
         logger.log(
             f"HF count: {fmt_num(existing_count)}, Local count: {fmt_num(new_count)}",
             phase="DEBUG",
         )
-        logger.log(f"HF hash: {existing_hash}, Local hash: {new_hash}", phase="DEBUG")
+        logger.log(
+            f"HF hash: {existing_hash}, Local hash: {new_hash}; "
+            f"compared columns: {', '.join(compare_columns)}",
+            phase="DEBUG",
+        )
 
         if existing_count != new_count:
             logger.log(
@@ -86,7 +104,7 @@ def needs_push(new_data_path: Path, repo_id: str) -> bool:
             return True
 
         return False
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - remote files can fail in several ways
         logger.log(f"Could not compare with remote: {e}", phase="WARN")
         return True
 
@@ -96,7 +114,7 @@ class Logger:
         self.quiet = quiet
 
     def log(self, message: str, phase: str = "INFO"):
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         line = f"[{timestamp}] {phase}: {message}"
         if self.quiet:
             print(message, file=sys.stderr)
@@ -201,7 +219,7 @@ async def fetch_sitemap_to_records(client: httpx.AsyncClient, url: str) -> list[
             )
 
         return results
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - one failed sitemap should not abort the run
         logger.log(f"Error fetching {url}: {e}", phase="ERROR")
         return []
 
@@ -247,7 +265,7 @@ async def fetch_and_stream_to_chunks(
     temp_dir: Path,
     concurrency: int,
 ) -> int:
-    fetched_at = datetime.now(timezone.utc).isoformat()
+    fetched_at = datetime.now(UTC).isoformat()
     acc = ChunkAccumulator()
     semaphore = anyio.Semaphore(concurrency)
 

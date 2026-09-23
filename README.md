@@ -4,6 +4,8 @@
 
 A dataset of every URL from the [Grokipedia](https://grokipedia.com) sitemap, refreshed weekly via GitHub Actions and pushed to HuggingFace Hub.
 
+The scheduled action compares the collected dataset with the existing Hub dataset before pushing. Runs that only change the generated `fetched_at` timestamp do not create a new Hub commit.
+
 ## Dataset
 
 **[caentzminger/grokipedia-urls](https://huggingface.co/datasets/caentzminger/grokipedia-urls)** on HuggingFace Hub.
