@@ -13,7 +13,7 @@ The scheduled action compares the collected dataset with the existing Hub datase
 | Column | Type | Description |
 |--------|------|-------------|
 | `url` | string | The page URL |
-| `lastmod` | date | Last modified date |
+| `lastmod` | date | Sitemap-declared date (stale since 2026-01-26, not ground truth post-v0.3) |
 | `changefreq` | enum | Change frequency (always, hourly, daily, weekly, monthly, yearly, never) |
 | `priority` | float32 | Sitemap priority |
 | `sitemap_source` | string | Which child sitemap this URL came from |
