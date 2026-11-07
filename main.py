@@ -8,7 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import anyio
@@ -25,6 +25,9 @@ SITEMAP_INDEX_URL = "https://assets.grokipedia.com/sitemap/sitemap-index.xml"
 HF_REPO_ID = "caentzminger/grokipedia-urls"
 CONCURRENCY_LIMIT = 20
 VOLATILE_DATASET_COLUMNS = {"fetched_at"}
+MAX_FETCH_RETRIES = 3
+MIN_EXPECTED_ROWS = 5_000_000
+STALE_WARN_DAYS = 30
 
 pl.Config.set_engine_affinity("streaming")
 
@@ -187,41 +190,57 @@ async def fetch_sitemap_index(client: httpx.AsyncClient) -> list[str]:
     return [loc.text for loc in sitemap_locs if loc.text]
 
 
-async def fetch_sitemap_to_records(client: httpx.AsyncClient, url: str) -> list[dict]:
-    try:
-        response = await client.get(url)
-        response.raise_for_status()
+async def fetch_sitemap_to_records(
+    client: httpx.AsyncClient, url: str
+) -> list[dict] | None:
+    """Fetch one child sitemap. Returns None if it failed after retries."""
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_FETCH_RETRIES + 1):
+        try:
+            response = await client.get(url, timeout=30.0)
+            response.raise_for_status()
 
-        root = ET.fromstring(response.text)
-        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-        url_elements = root.findall(".//sm:url", ns)
+            root = ET.fromstring(response.text)
+            ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+            url_elements = root.findall(".//sm:url", ns)
 
-        results = []
-        for url_elem in url_elements:
-            loc = url_elem.find("sm:loc", ns)
-            if loc is None or not loc.text:
-                continue
+            results = []
+            for url_elem in url_elements:
+                loc = url_elem.find("sm:loc", ns)
+                if loc is None or not loc.text:
+                    continue
 
-            lastmod = url_elem.find("sm:lastmod", ns)
-            changefreq = url_elem.find("sm:changefreq", ns)
-            priority = url_elem.find("sm:priority", ns)
+                lastmod = url_elem.find("sm:lastmod", ns)
+                changefreq = url_elem.find("sm:changefreq", ns)
+                priority = url_elem.find("sm:priority", ns)
 
-            results.append(
-                {
-                    "url": loc.text,
-                    "lastmod": lastmod.text if lastmod is not None else None,
-                    "changefreq": changefreq.text if changefreq is not None else None,
-                    "priority": float(priority.text)
-                    if priority is not None and priority.text
-                    else None,
-                    "sitemap_source": url,
-                }
-            )
+                results.append(
+                    {
+                        "url": loc.text,
+                        "lastmod": lastmod.text if lastmod is not None else None,
+                        "changefreq": changefreq.text
+                        if changefreq is not None
+                        else None,
+                        "priority": float(priority.text)
+                        if priority is not None and priority.text
+                        else None,
+                        "sitemap_source": url,
+                    }
+                )
 
-        return results
-    except Exception as e:  # noqa: BLE001 - one failed sitemap should not abort the run
-        logger.log(f"Error fetching {url}: {e}", phase="ERROR")
-        return []
+            return results
+        except Exception as e:  # noqa: BLE001 - retry transient CDN failures
+            last_error = e
+            if attempt < MAX_FETCH_RETRIES:
+                logger.log(
+                    f"Retry {attempt}/{MAX_FETCH_RETRIES} for {url}: {e}",
+                    phase="WARN",
+                )
+                await anyio.sleep(float(attempt))
+            continue
+
+    logger.log(f"Error fetching {url}: {last_error}", phase="ERROR")
+    return None
 
 
 @dataclass
@@ -264,17 +283,21 @@ async def fetch_and_stream_to_chunks(
     sitemap_urls: list[str],
     temp_dir: Path,
     concurrency: int,
-) -> int:
+) -> tuple[int, list[str]]:
     fetched_at = datetime.now(UTC).isoformat()
     acc = ChunkAccumulator()
+    failed_urls: list[str] = []
     semaphore = anyio.Semaphore(concurrency)
 
-    async def fetch_one(url: str) -> list[dict]:
+    async def fetch_one(url: str) -> list[dict] | None:
         async with semaphore:
             return await fetch_sitemap_to_records(client, url)
 
     async def worker(url: str) -> None:
         records = await fetch_one(url)
+        if records is None:
+            failed_urls.append(url)
+            return
         acc.add(records, temp_dir, fetched_at)
 
     async with anyio.create_task_group() as tg:
@@ -282,7 +305,7 @@ async def fetch_and_stream_to_chunks(
             tg.start_soon(worker, url)
 
     acc.flush_remaining(temp_dir)
-    return acc.chunk_index
+    return acc.chunk_index, failed_urls
 
 
 @app.command()
@@ -314,88 +337,123 @@ def main(
     temp_dir = Path(tempfile.mkdtemp(prefix="grokipedia_chunks_"))
     logger.log(f"Temp directory: {temp_dir}", phase="INFO")
 
-    peak_rss = 0
+    try:
+        peak_rss = 0
 
-    async def _fetch_phases() -> None:
-        nonlocal peak_rss
-        async with httpx.AsyncClient() as client:
-            with track_resources("Phase 1: Fetch sitemap index"):
-                sitemap_urls = await fetch_sitemap_index(client)
-                logger.log(
-                    f"Found {fmt_num(len(sitemap_urls))} child sitemaps", phase="INFO"
-                )
+        async def _fetch_phases() -> None:
+            nonlocal peak_rss
+            async with httpx.AsyncClient() as client:
+                with track_resources("Phase 1: Fetch sitemap index"):
+                    sitemap_urls = await fetch_sitemap_index(client)
+                    logger.log(
+                        f"Found {fmt_num(len(sitemap_urls))} child sitemaps",
+                        phase="INFO",
+                    )
 
-            with track_resources("Phase 2: Fetch and chunk sitemaps"):
-                num_chunks = await fetch_and_stream_to_chunks(
-                    client, sitemap_urls, temp_dir, concurrency
-                )
-                logger.log(f"Created {fmt_num(num_chunks)} chunk files", phase="INFO")
+                with track_resources("Phase 2: Fetch and chunk sitemaps"):
+                    num_chunks, failed_urls = await fetch_and_stream_to_chunks(
+                        client, sitemap_urls, temp_dir, concurrency
+                    )
+                    logger.log(
+                        f"Created {fmt_num(num_chunks)} chunk files", phase="INFO"
+                    )
+                    if failed_urls:
+                        preview = ", ".join(failed_urls[:5])
+                        logger.log(
+                            f"{len(failed_urls)} sitemaps failed after "
+                            f"{MAX_FETCH_RETRIES} retries (e.g. {preview})",
+                            phase="ERROR",
+                        )
+                        raise RuntimeError(
+                            f"{len(failed_urls)} sitemap fetches failed, "
+                            "aborting to avoid a partial dataset"
+                        )
+
+            peak_rss = max(peak_rss, psutil.Process().memory_info().rss)
+
+        anyio.run(_fetch_phases)
+
+        with track_resources("Phase 3: Lazy combine and write"):
+            changefreq_categories = [
+                "always",
+                "hourly",
+                "daily",
+                "weekly",
+                "monthly",
+                "yearly",
+                "never",
+            ]
+
+            lf = pl.scan_parquet(temp_dir / "chunk_*.parquet")
+
+            lf = lf.with_columns(
+                [
+                    pl.col("lastmod").str.to_date(format="%Y-%m-%d", strict=False),
+                    pl.col("changefreq").cast(
+                        pl.Enum(categories=changefreq_categories)
+                    ),
+                    pl.col("priority").cast(pl.Float32),
+                    pl.col("fetched_at").str.to_datetime(
+                        format="%Y-%m-%dT%H:%M:%S%.f%z", strict=False
+                    ),
+                ]
+            )
+
+            if sort:
+                lf = lf.sort("url")
+
+            lf.sink_parquet(output, row_group_size=100_000)
 
         peak_rss = max(peak_rss, psutil.Process().memory_info().rss)
 
-    anyio.run(_fetch_phases)
+        df = pl.read_parquet(output)
+        logger.summary(len(df), peak_rss, output)
 
-    with track_resources("Phase 3: Lazy combine and write"):
-        changefreq_categories = [
-            "always",
-            "hourly",
-            "daily",
-            "weekly",
-            "monthly",
-            "yearly",
-            "never",
-        ]
-
-        lf = pl.scan_parquet(temp_dir / "chunk_*.parquet")
-
-        lf = lf.with_columns(
-            [
-                pl.col("lastmod").str.to_date(format="%Y-%m-%d", strict=False),
-                pl.col("changefreq").cast(pl.Enum(categories=changefreq_categories)),
-                pl.col("priority").cast(pl.Float32),
-                pl.col("fetched_at").str.to_datetime(
-                    format="%Y-%m-%dT%H:%M:%S%.f%z", strict=False
-                ),
-            ]
-        )
-
-        if sort:
-            lf = lf.sort("url")
-
-        lf.sink_parquet(output, row_group_size=100_000)
-
-    peak_rss = max(peak_rss, psutil.Process().memory_info().rss)
-
-    df = pl.read_parquet(output)
-    logger.summary(len(df), peak_rss, output)
-
-    if not keep_temp:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.log("Cleaned up temp directory", phase="DEBUG")
-
-    if not push:
-        return
-
-    token = os.getenv("HF_TOKEN")
-    if not token:
-        logger.log("HF_TOKEN not found in environment", phase="ERROR")
-        raise typer.Exit(code=1)
-
-    repo_id = hf_repo or HF_REPO_ID
-
-    if not force_push:
-        logger.log("Checking for updates...", phase="INFO")
-        if not needs_push(output, repo_id):
+        if len(df) < MIN_EXPECTED_ROWS:
             logger.log(
-                "Dataset unchanged, skipping push. Use --force-push to override.",
-                phase="INFO",
+                f"Row count {fmt_num(len(df))} below minimum "
+                f"{fmt_num(MIN_EXPECTED_ROWS)}, aborting to avoid a partial dataset",
+                phase="ERROR",
             )
+            raise typer.Exit(code=1)
+
+        max_lastmod = df["lastmod"].max()
+        if isinstance(max_lastmod, date):
+            stale_days = (datetime.now(UTC).date() - max_lastmod).days
+            if stale_days > STALE_WARN_DAYS:
+                logger.log(
+                    f"Sitemap lastmod max is {max_lastmod} "
+                    f"({stale_days} days ago), treating lastmod as stale",
+                    phase="WARN",
+                )
+
+        if not push:
             return
 
-    hf_dataset = Dataset.from_parquet(str(output))
-    hf_dataset.push_to_hub(repo_id, token=token, private=True)
+        token = os.getenv("HF_TOKEN")
+        if not token:
+            logger.log("HF_TOKEN not found in environment", phase="ERROR")
+            raise typer.Exit(code=1)
 
-    logger.log(f"Pushed to https://huggingface.co/datasets/{repo_id}", phase="DONE")
+        repo_id = hf_repo or HF_REPO_ID
+
+        if not force_push:
+            logger.log("Checking for updates...", phase="INFO")
+            if not needs_push(output, repo_id):
+                logger.log(
+                    "Dataset unchanged, skipping push. Use --force-push to override.",
+                    phase="INFO",
+                )
+                return
+
+        hf_dataset = Dataset.from_parquet(str(output))
+        hf_dataset.push_to_hub(repo_id, token=token, private=True)
+
+        logger.log(f"Pushed to https://huggingface.co/datasets/{repo_id}", phase="DONE")
+    finally:
+        if not keep_temp:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.log("Cleaned up temp directory", phase="DEBUG")
 
 
 if __name__ == "__main__":
