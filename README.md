@@ -1,6 +1,6 @@
 # grokipedia-urls
 
-[![Run Grokipedia URL Collector](https://github.com/caentzminger/grokipedia-urls/actions/workflows/update-uls-dataset.yml/badge.svg)](https://github.com/caentzminger/grokipedia-urls/actions/workflows/update-uls-dataset.yml)
+[![Run Grokipedia URL Collector](https://github.com/caentzminger/grokipedia-urls/actions/workflows/update-urls-dataset.yml/badge.svg)](https://github.com/caentzminger/grokipedia-urls/actions/workflows/update-urls-dataset.yml)
 
 A dataset of every URL from the [Grokipedia](https://grokipedia.com) sitemap, refreshed weekly via GitHub Actions and pushed to HuggingFace Hub.
 
